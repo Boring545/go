@@ -10,292 +10,262 @@
 
 // func addVV(z, x, y []Word) (c Word)
 TEXT ·addVV(SB), NOSPLIT, $0
-	MOV z_len+8(FP), X5
-	MOV x_base+24(FP), X6
-	MOV y_base+48(FP), X7
-	MOV z_base+0(FP), X8
-	// compute unrolled loop lengths
-	AND $3, X5, X9
-	SRL $2, X5
-	XOR X28, X28	// clear carry
-loop1:
-	BEQZ X9, loop1done
-loop1cont:
-	// unroll 1X
-	MOV 0(X6), X10
-	MOV 0(X7), X11
-	ADD X11, X10	// ADCS X11, X10, X10 (cr=X28)
-	SLTU X11, X10, X31	// ...
-	ADD X28, X10	// ...
-	SLTU X28, X10, X28	// ...
-	ADD X31, X28	// ...
-	MOV X10, 0(X8)
-	ADD $8, X6
-	ADD $8, X7
-	ADD $8, X8
-	SUB $1, X9
-	BNEZ X9, loop1cont
-loop1done:
-loop4:
-	BEQZ X5, loop4done
-loop4cont:
-	// unroll 4X
-	MOV 0(X6), X9
-	MOV 8(X6), X10
-	MOV 16(X6), X11
-	MOV 24(X6), X12
-	MOV 0(X7), X13
-	MOV 8(X7), X14
-	MOV 16(X7), X15
-	MOV 24(X7), X16
-	ADD X13, X9	// ADCS X13, X9, X9 (cr=X28)
-	SLTU X13, X9, X31	// ...
-	ADD X28, X9	// ...
-	SLTU X28, X9, X28	// ...
-	ADD X31, X28	// ...
-	ADD X14, X10	// ADCS X14, X10, X10 (cr=X28)
-	SLTU X14, X10, X31	// ...
-	ADD X28, X10	// ...
-	SLTU X28, X10, X28	// ...
-	ADD X31, X28	// ...
-	ADD X15, X11	// ADCS X15, X11, X11 (cr=X28)
-	SLTU X15, X11, X31	// ...
-	ADD X28, X11	// ...
-	SLTU X28, X11, X28	// ...
-	ADD X31, X28	// ...
-	ADD X16, X12	// ADCS X16, X12, X12 (cr=X28)
-	SLTU X16, X12, X31	// ...
-	ADD X28, X12	// ...
-	SLTU X28, X12, X28	// ...
-	ADD X31, X28	// ...
-	MOV X9, 0(X8)
-	MOV X10, 8(X8)
-	MOV X11, 16(X8)
-	MOV X12, 24(X8)
-	ADD $32, X6
-	ADD $32, X7
-	ADD $32, X8
-	SUB $1, X5
-	BNEZ X5, loop4cont
-loop4done:
-	MOV X28, c+72(FP)
-	RET
+    // 参数布局（Plan9 ABI）：
+    //   FP+8   → return address
+    //   FP+16  → z_base (pointer)
+    //   FP+24  → z_len  (length)
+    //   FP+32  → z_cap  (不用)
+    //   FP+40  → x_base
+    //   FP+48  → x_len
+    //   FP+56  → x_cap
+    //   FP+64  → y_base
+    //   FP+72  → y_len
+    //   FP+80  → y_cap
+    //   FP+88  → c (return carry)
+
+    // 1) 加载输入输出指针和长度
+    MOV     z_len+24(FP),  t0      // t0 = len(z) == len(x) == len(y)
+    MOV     x_base+40(FP), t1      // t1 = &x[0]
+    MOV     y_base+64(FP), t2      // t2 = &y[0]
+    MOV     z_base+16(FP), t3      // t3 = &z[0]
+
+    // 2) carry = 0
+    LI      t4, 0                  // t4 = carry
+
+.loop:
+    // 如果剩余长度为 0，跳出
+    BEQ     t0, zero, .done
+
+    // 设置向量寄存器宽度：e64（Word 为 uint64），掩码宽度 m1
+    // VL = min(t0, 最大可用元素数)
+    VSETVLI t5, t0, e64,m1
+
+    // 向量加载
+    VLWV    v0, (t1)               // v0 = x[i..i+VL-1]
+    VLWV    v1, (t2)               // v1 = y[...]
+
+    // 无进位加法
+    VADD.VV v2, v0, v1             // v2 = v0 + v1
+
+    // 计算每个元素的本地进位：当 sum < x 时说明有进位
+    VSLTU.VV v3, v2, v0            // v3[j]=1 if v2[j]<v0[j]
+
+    // 将标量 carry 扩成向量
+    VMV.V.X v4, t4                 // v4[:] = carry
+
+    // 把上一次 carry 加到本次结果
+    VADD.VV v2, v2, v4             // v2 = v2 + v4
+
+    // 本轮由于加 carry 而产生的新进位
+    VSLTU.VV v5, v2, v4            // v5[j]=1 if v2[j]<v4
+
+    // 合并本地进位与新进位
+    VOR.VV  v3, v3, v5             // v3 = v3 OR v5
+
+    // 将本块结果存回 z
+    VSWV    v2, (t3)
+
+    // 提取最后一个元素的进位（用于下一块）
+    // vmv.x.s 会把掩码向量寄存器 v3 的“最高已配置位”对应的掩码输出到 t4
+    // 这样 t4 要么是 0，要么是 1
+    VMV.X.S t4, v3
+
+    // 指针和长度更新：按块推进
+    // t5 = VL × sizeof(Word) = VL × 8
+    SLLI    t6, t5, 3             // t6 = VL << 3 = byte count
+    ADD     t1, t6                // x += byte count
+    ADD     t2, t6                // y += …
+    ADD     t3, t6                // z += …
+
+    SUB     t0, t5, t0            // len -= VL
+
+    J       .loop
+
+.done:
+    // 把最终 carry 存到返回值 c
+    MOV     t4, c+88(FP)
+    RET
+
 
 // func subVV(z, x, y []Word) (c Word)
 TEXT ·subVV(SB), NOSPLIT, $0
-	MOV z_len+8(FP), X5
-	MOV x_base+24(FP), X6
-	MOV y_base+48(FP), X7
-	MOV z_base+0(FP), X8
-	// compute unrolled loop lengths
-	AND $3, X5, X9
-	SRL $2, X5
-	XOR X28, X28	// clear carry
-loop1:
-	BEQZ X9, loop1done
-loop1cont:
-	// unroll 1X
-	MOV 0(X6), X10
-	MOV 0(X7), X11
-	SLTU X28, X10, X31	// SBCS X11, X10, X10
-	SUB X28, X10	// ...
-	SLTU X11, X10, X28	// ...
-	SUB X11, X10	// ...
-	ADD X31, X28	// ...
-	MOV X10, 0(X8)
-	ADD $8, X6
-	ADD $8, X7
-	ADD $8, X8
-	SUB $1, X9
-	BNEZ X9, loop1cont
-loop1done:
-loop4:
-	BEQZ X5, loop4done
-loop4cont:
-	// unroll 4X
-	MOV 0(X6), X9
-	MOV 8(X6), X10
-	MOV 16(X6), X11
-	MOV 24(X6), X12
-	MOV 0(X7), X13
-	MOV 8(X7), X14
-	MOV 16(X7), X15
-	MOV 24(X7), X16
-	SLTU X28, X9, X31	// SBCS X13, X9, X9
-	SUB X28, X9	// ...
-	SLTU X13, X9, X28	// ...
-	SUB X13, X9	// ...
-	ADD X31, X28	// ...
-	SLTU X28, X10, X31	// SBCS X14, X10, X10
-	SUB X28, X10	// ...
-	SLTU X14, X10, X28	// ...
-	SUB X14, X10	// ...
-	ADD X31, X28	// ...
-	SLTU X28, X11, X31	// SBCS X15, X11, X11
-	SUB X28, X11	// ...
-	SLTU X15, X11, X28	// ...
-	SUB X15, X11	// ...
-	ADD X31, X28	// ...
-	SLTU X28, X12, X31	// SBCS X16, X12, X12
-	SUB X28, X12	// ...
-	SLTU X16, X12, X28	// ...
-	SUB X16, X12	// ...
-	ADD X31, X28	// ...
-	MOV X9, 0(X8)
-	MOV X10, 8(X8)
-	MOV X11, 16(X8)
-	MOV X12, 24(X8)
-	ADD $32, X6
-	ADD $32, X7
-	ADD $32, X8
-	SUB $1, X5
-	BNEZ X5, loop4cont
-loop4done:
-	MOV X28, c+72(FP)
-	RET
+    // Plan9 ABI 参数布局：
+    //   FP+8   → 返回地址
+    //   FP+16  → z_base (pointer)
+    //   FP+24  → z_len  (length)
+    //   FP+32  → z_cap  (unused)
+    //   FP+40  → x_base
+    //   FP+48  → x_len
+    //   FP+56  → x_cap  (unused)
+    //   FP+64  → y_base
+    //   FP+72  → y_len
+    //   FP+80  → y_cap  (unused)
+    //   FP+88  → c      (返回的最终借位)
+
+    // 1) 加载指针和长度
+    MOV     z_len+24(FP), t0      // t0 = len(z) == len(x) == len(y)
+    MOV     x_base+40(FP), t1     // t1 = &x[0]
+    MOV     y_base+64(FP), t2     // t2 = &y[0]
+    MOV     z_base+16(FP), t3     // t3 = &z[0]
+
+    // 2) borrow = 0
+    LI      t4, 0                 // t4 作为标量 borrow
+
+.loop:
+    // 如果没有剩余元素，退出
+    BEQ     t0, zero, .done
+
+    // 3) 设置向量长度 VL = min(t0, 最大VL)
+    VSETVLI t5, t0, e64,m1        // t5 ← VL（元素个数）
+
+    // 4) 向量加载 x 和 y
+    VLWV    v0, (t1)              // v0 = x[i..i+VL-1]
+    VLWV    v1, (t2)              // v1 = y[...]
+
+    // 5) 先把借位标量扩成向量
+    VMV.V.X v4, t4                // v4[:] = borrow
+
+    // 6) 先做 y + borrow，检测此加法本身是否产生借位（即溢出）
+    VADD.VV v5, v1, v4            // v5 = y + borrow
+    VSLTU.VV v6, v5, v1           // v6[j]=1 if v5[j]<v1[j] → borrow1
+
+    // 7) 主减：x - (y+borrow)
+    VSUB.VV v2, v0, v5            // v2 = x - v5
+    VSLTU.VV v7, v0, v5           // v7[j]=1 if x[j]<v5[j] → borrow2
+
+    // 8) 合并两轮借位
+    VOR.VV  v6, v6, v7            // v6 = borrow1 OR borrow2
+
+    // 9) 存回结果
+    VSWV    v2, (t3)
+
+    // 10) 从掩码 v6 提取当前块最后一位的借位，作为下一块的输入
+    VMV.X.S t4, v6                // t4 = 0 or 1
+
+    // 11) 指针、长度推进
+    //    t5 = VL（元素数），每元素 8 字节
+    SLLI    t6, t5, 3             // t6 = VL * 8 = 字节数
+    ADD     t1, t6                // x += byte count
+    ADD     t2, t6                // y += byte count
+    ADD     t3, t6                // z += byte count
+
+    SUB     t0, t5, t0            // len -= VL
+    J       .loop
+
+.done:
+    // 12) 存储最终 borrow 到返回值 c
+    MOV     t4, c+88(FP)
+    RET
+
 
 // func lshVU(z, x []Word, s uint) (c Word)
 TEXT ·lshVU(SB), NOSPLIT, $0
-	MOV z_len+8(FP), X5
-	BEQZ X5, ret0
-	MOV s+48(FP), X6
-	MOV x_base+24(FP), X7
-	MOV z_base+0(FP), X8
-	// run loop backward
-	SLL $3, X5, X9
-	ADD X9, X7
-	SLL $3, X5, X9
-	ADD X9, X8
-	// shift first word into carry
-	MOV -8(X7), X9
-	MOV $64, X10
-	SUB X6, X10
-	SRL X10, X9, X11
-	SLL X6, X9
-	MOV X11, c+56(FP)
-	// shift remaining words
-	SUB $1, X5
-	// compute unrolled loop lengths
-	AND $3, X5, X11
-	SRL $2, X5
-loop1:
-	BEQZ X11, loop1done
-loop1cont:
-	// unroll 1X
-	MOV -16(X7), X12
-	SRL X10, X12, X13
-	OR X9, X13
-	SLL X6, X12, X9
-	MOV X13, -8(X8)
-	ADD $-8, X7
-	ADD $-8, X8
-	SUB $1, X11
-	BNEZ X11, loop1cont
-loop1done:
-loop4:
-	BEQZ X5, loop4done
-loop4cont:
-	// unroll 4X
-	MOV -16(X7), X11
-	MOV -24(X7), X12
-	MOV -32(X7), X13
-	MOV -40(X7), X14
-	SRL X10, X11, X15
-	OR X9, X15
-	SLL X6, X11, X9
-	SRL X10, X12, X11
-	OR X9, X11
-	SLL X6, X12, X9
-	SRL X10, X13, X12
-	OR X9, X12
-	SLL X6, X13, X9
-	SRL X10, X14, X13
-	OR X9, X13
-	SLL X6, X14, X9
-	MOV X15, -8(X8)
-	MOV X11, -16(X8)
-	MOV X12, -24(X8)
-	MOV X13, -32(X8)
-	ADD $-32, X7
-	ADD $-32, X8
-	SUB $1, X5
-	BNEZ X5, loop4cont
-loop4done:
-	// store final shifted bits
-	MOV X9, -8(X8)
-	RET
-ret0:
-	MOV X0, c+56(FP)
-	RET
+    // 参数：
+    //   FP+16 → z_base, FP+24 → z_len
+    //   FP+40 → x_base, FP+48 → x_len
+    //   FP+56 → s,     FP+64 → c（返回值）
+    MOV     z_len+24(FP), t0      // t0 = len
+    BEQ     t0, zero, .ret_zero
+    MOV     s+56(FP),    t5      // t5 = shift s
+    MOV     x_base+40(FP), t1    // t1 = &x[0]
+    MOV     z_base+16(FP), t2    // t2 = &z[0]
+    // 计算 s' = 64 - s
+    LI      t6, 64
+    SUB     t5, t6, t6           // t6 = 64 - s (for extracting top bits)
+    // 初始 carry 为 0
+    LI      t4, 0
+
+.loop:
+    BEQ     t0, zero, .done
+    // VL = min(t0, MAXVL)
+    VSETVLI t7, t0, e64,m1       // t7 ← VL（元素数）
+
+    // 1) load
+    VLWV    v0, (t1)             // v0 = x[..VL]
+    // 2) shifted-value
+    VSLL.VX v1, v0, t5           // v1 = v0 << s
+    // 3) bits to carry to next element
+    VSRL.VX v2, v0, t6           // v2 = v0 >> (64-s)
+    // 4) slide those bits DOWN by 1 lane, lowest lane gets scalar t4
+    VSLIDE1DOWN.VX v3, v2, t4    // v3[j] = j<VL-1 ? v2[j+1] : t4
+    // 5) combine
+    VOR.VV  v4, v1, v3           // v4 = v1 | v3
+    // 6) store
+    VSWV    v4, (t2)
+
+    // 7) 提取 v2[VL-1]（最高已配置元素）的 carry
+    //    VMV.X.S 会把最后一个掩码位映射的向量元素搬出到标量
+    VMV.X.S t4, v2               // t4 = carry_out
+
+    // 8) 指针推进
+    SLLI    t8, t7, 3            // t8 = VL * 8 bytes
+    ADD     t1, t8               // x += t8
+    ADD     t2, t8               // z += t8
+    SUB     t0, t7, t0           // len -= VL
+    J       .loop
+
+.done:
+    MOV     t4, c+64(FP)         // write back carry
+    RET
+
+.ret_zero:
+    // len==0 时 carry=0
+    MOV     zero, c+64(FP)
+    RET
+
 
 // func rshVU(z, x []Word, s uint) (c Word)
 TEXT ·rshVU(SB), NOSPLIT, $0
-	MOV z_len+8(FP), X5
-	BEQZ X5, ret0
-	MOV s+48(FP), X6
-	MOV x_base+24(FP), X7
-	MOV z_base+0(FP), X8
-	// shift first word into carry
-	MOV 0(X7), X9
-	MOV $64, X10
-	SUB X6, X10
-	SLL X10, X9, X11
-	SRL X6, X9
-	MOV X11, c+56(FP)
-	// shift remaining words
-	SUB $1, X5
-	// compute unrolled loop lengths
-	AND $3, X5, X11
-	SRL $2, X5
-loop1:
-	BEQZ X11, loop1done
-loop1cont:
-	// unroll 1X
-	MOV 8(X7), X12
-	SLL X10, X12, X13
-	OR X9, X13
-	SRL X6, X12, X9
-	MOV X13, 0(X8)
-	ADD $8, X7
-	ADD $8, X8
-	SUB $1, X11
-	BNEZ X11, loop1cont
-loop1done:
-loop4:
-	BEQZ X5, loop4done
-loop4cont:
-	// unroll 4X
-	MOV 8(X7), X11
-	MOV 16(X7), X12
-	MOV 24(X7), X13
-	MOV 32(X7), X14
-	SLL X10, X11, X15
-	OR X9, X15
-	SRL X6, X11, X9
-	SLL X10, X12, X11
-	OR X9, X11
-	SRL X6, X12, X9
-	SLL X10, X13, X12
-	OR X9, X12
-	SRL X6, X13, X9
-	SLL X10, X14, X13
-	OR X9, X13
-	SRL X6, X14, X9
-	MOV X15, 0(X8)
-	MOV X11, 8(X8)
-	MOV X12, 16(X8)
-	MOV X13, 24(X8)
-	ADD $32, X7
-	ADD $32, X8
-	SUB $1, X5
-	BNEZ X5, loop4cont
-loop4done:
-	// store final shifted bits
-	MOV X9, 0(X8)
-	RET
-ret0:
-	MOV X0, c+56(FP)
-	RET
+    // 参数：
+    //   FP+16 → z_base, FP+24 → z_len
+    //   FP+40 → x_base, FP+48 → x_len
+    //   FP+56 → s,     FP+64 → c（返回值）
+    MOV     z_len+24(FP), t0      // t0 = len
+    BEQ     t0, zero, .ret_zero2
+    MOV     s+56(FP),    t5      // t5 = shift s
+    MOV     x_base+40(FP), t1    // t1 = &x[0]
+    MOV     z_base+16(FP), t2    // t2 = &z[0]
+    // 计算 s' = 64 - s
+    LI      t6, 64
+    SUB     t5, t6, t6           // t6 = 64 - s
+    // 初始 carry 为 0
+    LI      t4, 0
+
+.loop2:
+    BEQ     t0, zero, .done2
+    VSETVLI t7, t0, e64,m1       // t7 ← VL
+
+    VLWV    v0, (t1)             // load
+    // 1) main right shift
+    VSRL.VX v1, v0, t5           // v1 = v0 >> s
+    // 2) bits to bring in from next element
+    VSLL.VX v2, v0, t6           // v2 = v0 << (64-s)
+    // 3) slide those bits UP by 1 lane, highest lane gets scalar t4
+    VSLIDE1UP.VX v3, v2, t4      // v3[j] = j>0 ? v2[j-1] : t4
+    // 4) combine
+    VOR.VV  v4, v1, v3
+    VSWV    v4, (t2)
+
+    // 5) extract carry_out = v2[0]
+    //    先把 v2 “滚” 一下，让待提取元素跑到最高已配置位，
+    //    再 VMV.X.S
+    VSLIDE1UP.VX v5, v2, zero    // v5[j]=j>0?v2[j-1]:0  （把 v2[0] 移到 v5[1]…）
+    VMV.X.S t4, v5               // t4 = v2[0]
+
+    SLLI    t8, t7, 3
+    ADD     t1, t8
+    ADD     t2, t8
+    SUB     t0, t7, t0
+    J       .loop2
+
+.done2:
+    MOV     t4, c+64(FP)
+    RET
+
+.ret_zero2:
+    MOV     zero, c+64(FP)
+    RET
+
 
 // func mulAddVWW(z, x []Word, m, a Word) (c Word)
 TEXT ·mulAddVWW(SB), NOSPLIT, $0
